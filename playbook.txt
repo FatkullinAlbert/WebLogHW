@@ -1,0 +1,158 @@
+- hosts: all
+  become: yes
+  vars:
+    log_server_ip: 192.168.56.11
+    web_ip: 192.168.56.10
+  tasks:
+    - name: Установка общего ПО (chrony)
+      apt:
+        name: chrony
+        state: present
+        update_cache: yes
+
+    - name: Запуск и включение chrony
+      service:
+        name: chrony
+        state: started
+        enabled: yes
+
+- hosts: web
+  become: yes
+  vars:
+    log_server_ip: 192.168.56.11
+  tasks:
+    - name: Установка nginx и auditd
+      apt:
+        name:
+          - nginx
+          - auditd
+        state: present
+
+    - name: Настройка nginx для отправки access-логов на удаленный сервер
+      lineinfile:
+        path: /etc/nginx/nginx.conf
+        regexp: '^\s*access_log'
+        line: '        access_log syslog:server={{ log_server_ip }}:514,tag=nginx_access combined;'
+        insertafter: 'http {'
+
+    - name: Настройка nginx для error-лога (локально + удалённо)
+      blockinfile:
+        path: /etc/nginx/nginx.conf
+        insertafter: 'error_log /var/log/nginx/error.log;'
+        content: |
+
+          error_log syslog:server={{ log_server_ip }}:514,tag=nginx_error;
+        marker: "# {mark} ANSIBLE MANAGED BLOCK"
+
+    - name: Проверка конфигурации nginx
+      command: nginx -t
+      register: nginx_test
+      changed_when: false
+
+    - name: Перезапуск nginx
+      service:
+        name: nginx
+        state: restarted
+      when: nginx_test.rc == 0
+
+    - name: Создание правил аудита для отслеживания изменений конфигурации nginx
+      copy:
+        dest: /etc/audit/rules.d/nginx.rules
+        content: |
+          -w /etc/nginx/nginx.conf -p wa -k nginx_conf
+          -w /etc/nginx/sites-available/ -p wa -k nginx_sites
+          -w /etc/nginx/sites-enabled/ -p wa -k nginx_sites
+        mode: 0640
+      notify: restart auditd
+
+    - name: Применение правил аудита
+      command: augenrules
+      changed_when: false
+
+    - name: Настройка rsyslog для отправки всех системных логов на удалённый сервер
+      lineinfile:
+        path: /etc/rsyslog.d/50-default.conf
+        regexp: '^\*\.\* @@'
+        line: '*.* @{{ log_server_ip }}:514'
+        insertafter: EOF
+
+    - name: Настройка rsyslog для чтения и отправки логов auditd
+      copy:
+        dest: /etc/rsyslog.d/30-audit.conf
+        content: |
+          module(load="imfile")
+          input(type="imfile"
+                File="/var/log/audit/audit.log"
+                Tag="audit"
+                Severity="info"
+                Facility="local6")
+        mode: 0644
+
+    - name: Перезапуск rsyslog
+      service:
+        name: rsyslog
+        state: restarted
+
+  handlers:
+    - name: restart auditd
+      service:
+        name: auditd
+        state: restarted
+
+- hosts: log
+  become: yes
+  vars:
+    web_ip: 192.168.56.10
+  tasks:
+    - name: Установка rsyslog (обычно уже есть)
+      apt:
+        name: rsyslog
+        state: present
+
+    - name: Включение приёма логов по UDP и TCP в rsyslog
+      lineinfile:
+        path: /etc/rsyslog.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^#?module\(load="imudp"\)', line: 'module(load="imudp")' }
+        - { regexp: '^#?input\(type="imudp" port="514"\)', line: 'input(type="imudp" port="514")' }
+        - { regexp: '^#?module\(load="imtcp"\)', line: 'module(load="imtcp")' }
+        - { regexp: '^#?input\(type="imtcp" port="514"\)', line: 'input(type="imtcp" port="514")' }
+
+    - name: Создание каталога для удалённых логов
+      file:
+        path: /var/log/rsyslog/web
+        state: directory
+        owner: syslog
+        group: adm
+        mode: 0755
+
+    - name: Настройка шаблонов и правил сортировки логов с web
+      blockinfile:
+        path: /etc/rsyslog.conf
+        insertbefore: '^\$IncludeConfig'
+        content: |
+          # Правила для логов с web-сервера
+          if $fromhost-ip == '{{ web_ip }}' then {
+              if $programname == 'nginx_access' then {
+                  action(type="omfile" file="/var/log/rsyslog/web/nginx_access.log")
+              } else if $programname == 'nginx_error' then {
+                  action(type="omfile" file="/var/log/rsyslog/web/nginx_error.log")
+              } else if $programname == 'audit' then {
+                  action(type="omfile" file="/var/log/rsyslog/web/audit.log")
+              } else {
+                  action(type="omfile" file="/var/log/rsyslog/web/syslog.log")
+              }
+              stop
+          }
+        marker: "# {mark} ANSIBLE MANAGED RULES FOR WEB"
+        marker_begin: "BEGIN WEB RULES"
+        marker_end: "END WEB RULES"
+
+    - name: Перезапуск rsyslog
+      service:
+        name: rsyslog
+        state: restarted
+
